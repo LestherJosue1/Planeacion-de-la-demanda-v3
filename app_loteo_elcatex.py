@@ -208,7 +208,7 @@ def parse_reglas_operativas(xlsm_path):
         "ANCHO18_ALLOW_SPILLOVER_2600": 0,
         "ANCHO18_ALLOWED_MAX_DYE": {2200.0, 1100.0},
 
-        "BEAM_WIDTH": 3,
+        "BEAM_WIDTH": 20,
         "W_FILL": 5.0,
         "W_CAP_LOSS": 3.0,
         "WIDTH_PREF_LIST": [4, 3, 2, 1],
@@ -216,7 +216,7 @@ def parse_reglas_operativas(xlsm_path):
         "W_1100_WIDTHS_STRICT": 10.0,
 
         "WIDTHS_TARGET_ORDER": "4>3>2>1",
-        "REQUIRE_WIDTHS_STRICT": 1,
+        "REQUIRE_WIDTHS_STRICT": 0,
         "ALLOWED_MAXIMO_FOR_3_WIDTHS": {"DYE": {4000.0, 3300.0, 2600.0, 2200.0}, "BLEACH": set()},
         "ALLOWED_MAXIMO_FOR_4_WIDTHS": {"DYE": {4000.0, 3300.0, 2600.0, 2200.0}, "BLEACH": set()},
 
@@ -937,7 +937,7 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
                     blocked.add(b)
                     continue
 
-                beam_w = int(params.get("BEAM_WIDTH", 3))
+                beam_w = int(params.get("BEAM_WIDTH", 20))
                 top_seeds = cand.sort_values("LBS_RESTANTES", ascending=False).head(beam_w).index.tolist()
 
                 best_lote = None
@@ -958,7 +958,7 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
 
                     order_text = norm_str(params.get("WIDTHS_TARGET_ORDER", "4>3>2>1"))
                     targets = [int(x) for x in order_text.split(">") if x.strip().isdigit()]
-                    req_strict = int(params.get("REQUIRE_WIDTHS_STRICT", 1)) == 1
+                    req_strict = int(params.get("REQUIRE_WIDTHS_STRICT", 0)) == 1
 
                     pri_list = order_priorities(rule_info.get("prioridades", []), params)
                     use_upgrades = (len(pri_list) > 0 and int(params.get("UPGRADE_CATEGORIA", 0)) == 1)
@@ -1198,14 +1198,14 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
         ["ANCHO18_ALLOW_SPILLOVER_2600", params.get("ANCHO18_ALLOW_SPILLOVER_2600", 0)],
         ["ANCHO18_ALLOWED_MAX_DYE", ",".join(sorted(str(int(x)) for x in params.get("ANCHO18_ALLOWED_MAX_DYE", {2200.0, 1100.0})))],
         ["SCRAP_REMAINDER_BELOW_SPLIT_MIN", params.get("SCRAP_REMAINDER_BELOW_SPLIT_MIN", 0)],
-        ["BEAM_WIDTH", params.get("BEAM_WIDTH", 3)],
+        ["BEAM_WIDTH", params.get("BEAM_WIDTH", 20)],
         ["W_FILL", params.get("W_FILL", 5.0)],
         ["W_CAP_LOSS", params.get("W_CAP_LOSS", 3.0)],
         ["WIDTH_PREF_LIST", ",".join(str(x) for x in params.get("WIDTH_PREF_LIST", [4, 3, 2, 1]))],
         ["W_WIDTH_PREF", params.get("W_WIDTH_PREF", 2.0)],
         ["W_1100_WIDTHS_STRICT", params.get("W_1100_WIDTHS_STRICT", 10.0)],
         ["WIDTHS_TARGET_ORDER", params.get("WIDTHS_TARGET_ORDER", "4>3>2>1")],
-        ["REQUIRE_WIDTHS_STRICT", params.get("REQUIRE_WIDTHS_STRICT", 1)],
+        ["REQUIRE_WIDTHS_STRICT", params.get("REQUIRE_WIDTHS_STRICT", 0)],
         ["ALLOWED_MAXIMO_FOR_3_WIDTHS_DYE", ",".join(str(int(x)) for x in sorted(params.get("ALLOWED_MAXIMO_FOR_3_WIDTHS", {}).get("DYE", set()), reverse=True))],
         ["ALLOWED_MAXIMO_FOR_4_WIDTHS_DYE", ",".join(str(int(x)) for x in sorted(params.get("ALLOWED_MAXIMO_FOR_4_WIDTHS", {}).get("DYE", set()), reverse=True))],
         ["ALLOWED_MAXIMO_FOR_3_WIDTHS_BLEACH", ",".join(str(int(x)) for x in sorted(params.get("ALLOWED_MAXIMO_FOR_3_WIDTHS", {}).get("BLEACH", set()), reverse=True))],
@@ -1839,7 +1839,7 @@ with tabs[12]:
         params["UPGRADE_CATEGORIA"] = 1 if st.checkbox("UPGRADE_CATEGORIA", value=bool(params["UPGRADE_CATEGORIA"])) else 0
     with c3:
         params["TRY_ALL_PRIORITIES"] = 1 if st.checkbox("TRY_ALL_PRIORITIES", value=bool(params["TRY_ALL_PRIORITIES"])) else 0
-        params["REQUIRE_WIDTHS_STRICT"] = 1 if st.checkbox("REQUIRE_WIDTHS_STRICT", value=bool(params["REQUIRE_WIDTHS_STRICT"])) else 0
+        params["REQUIRE_WIDTHS_STRICT"] = 0 if st.checkbox("REQUIRE_WIDTHS_STRICT", value=bool(params["REQUIRE_WIDTHS_STRICT"])) else 0
         params["WIDTHS_TARGET_ORDER"] = st.text_input("WIDTHS_TARGET_ORDER", value=params["WIDTHS_TARGET_ORDER"])
 
     wpl = st.text_input("WIDTH_PREF_LIST (coma-separado)", value=",".join(str(x) for x in params["WIDTH_PREF_LIST"]))
