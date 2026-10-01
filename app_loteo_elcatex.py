@@ -185,7 +185,7 @@ def parse_reglas_operativas(xlsm_path):
         "MAX_WIDTHS_BY_CAT": dict(DEFAULT_MAX_WIDTHS_BY_CAT),
         "MAX_WIDTHS_DEFAULT": 4,
 
-        "SPLIT_MIN_LBS_DEFAULT": obs_split_minimo if obs_split_minimo is not None else 500.0,
+        "SPLIT_MIN_LBS_DEFAULT": obs_split_minimo if obs_split_minimo is not None else 250.0,
         "SPLIT_MIN_LBS_ANCHO18": 250.0,
         "SCRAP_REMAINDER_BELOW_SPLIT_MIN": 0,
 
@@ -208,7 +208,9 @@ def parse_reglas_operativas(xlsm_path):
         "ANCHO18_ALLOW_SPILLOVER_2600": 0,
         "ANCHO18_ALLOWED_MAX_DYE": {2200.0, 1100.0},
 
-        "BEAM_WIDTH": 20,
+        "BEAM_WIDTH": 12,
+        "SMALL_SPLIT_REUSE_MIN": 100.0,
+        "PRIORIZE_LARGE_CATEGORIES": 1,
         "W_FILL": 5.0,
         "W_CAP_LOSS": 3.0,
         "WIDTH_PREF_LIST": [4, 3, 2, 1],
@@ -363,24 +365,31 @@ def get_row_widths(work, idx):
     return widths
 
 # ---------------------------- Split chooser ----------------------------
-def choose_take(rest, remaining, split_min_lbs, allow_scrap_residue=False):
+def choose_take(rest, remaining, split_min_lbs, allow_scrap_residue=False, small_reuse_min=100.0):
+    """No crea splits nuevos menores al mínimo; reutiliza saldos completos de 100 a 249 lb."""
     try:
+        rest = float(rest)
+        remaining = float(remaining)
         split_min_lbs = float(split_min_lbs)
+        small_reuse_min = float(small_reuse_min)
     except Exception:
-        split_min_lbs = 0.0
-    if rest <= 0 or remaining <= 0:
         return 0.0
+    if rest <= 1e-9 or remaining <= 1e-9:
+        return 0.0
+    # Un saldo existente >=100 puede utilizarse completo para completar un lote.
     if rest <= remaining + 1e-9:
-        return float(rest)
-    take = float(remaining)
+        return rest if rest + 1e-9 >= small_reuse_min else 0.0
+    take = remaining
+    # Una división nueva siempre debe respetar el mínimo operativo.
     if take + 1e-9 < split_min_lbs:
         return 0.0
-    residue = float(rest) - take
-    if residue > 1e-9 and residue + 1e-9 < split_min_lbs:
-        if not allow_scrap_residue:
-            return 0.0
+    residue = rest - take
+    if residue <= 1e-9 or residue + 1e-9 >= split_min_lbs:
         return take
-    return take
+    # Se permite conservar un remanente reutilizable entre 100 y split_min-1.
+    if small_reuse_min - 1e-9 <= residue < split_min_lbs - 1e-9:
+        return take
+    return take if allow_scrap_residue else 0.0
 
 # ---------------------------- Ranges builder ----------------------------
 def build_ranges(df_cap):
@@ -731,9 +740,9 @@ def intentar_lote_para_rango(work, seed_idx, rango, capacity_used, params, rule_
         return None
 
     try:
-        split_min_lbs = float(split_min_lbs if split_min_lbs is not None else params.get("SPLIT_MIN_LBS_DEFAULT", 500.0))
+        split_min_lbs = float(split_min_lbs if split_min_lbs is not None else params.get("SPLIT_MIN_LBS_DEFAULT", 250.0))
     except Exception:
-        split_min_lbs = float(params.get("SPLIT_MIN_LBS_DEFAULT", 500.0))
+        split_min_lbs = float(params.get("SPLIT_MIN_LBS_DEFAULT", 250.0))
     allow_scrap_residue = int(params.get("SCRAP_REMAINDER_BELOW_SPLIT_MIN", 0)) == 1
 
     lote_rows = []
@@ -937,124 +946,102 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
                     blocked.add(b)
                     continue
 
-                beam_w = int(params.get("BEAM_WIDTH", 20))
+                beam_w = int(params.get("BEAM_WIDTH", 12))
                 top_seeds = cand.sort_values("LBS_RESTANTES", ascending=False).head(beam_w).index.tolist()
 
                 best_lote = None
                 best_pack = None
-                best_score = -1e30
+                best_selection_key = None
 
                 for seed_idx in top_seeds:
                     ranges_try, rule_info = reorder_ranges_for_seed(ranges_mix, mixv, work, seed_idx, params)
 
+                    # ANCHO18 es una restricción dura de categoría.
                     if rule_info.get("regla_aplicada") == "ANCHO18" and up(mixv) == "DYE":
                         allowed = set(params.get("ANCHO18_ALLOWED_MAX_DYE", {2200.0, 1100.0}))
                         if int(params.get("ANCHO18_ALLOW_SPILLOVER_2600", 0)) == 1:
                             allowed.add(2600.0)
                         ranges_try = [r for r in ranges_try if float(r["MAXIMO"]) in allowed]
 
-                    lote = None
-                    prioridad_obj = None
-
-                    order_text = norm_str(params.get("WIDTHS_TARGET_ORDER", "4>3>2>1"))
-                    targets = [int(x) for x in order_text.split(">") if x.strip().isdigit()]
-                    req_strict = int(params.get("REQUIRE_WIDTHS_STRICT", 0)) == 1
-
+                    # Familia/color/combo definen un techo y permiten esa categoría hacia abajo.
                     pri_list = order_priorities(rule_info.get("prioridades", []), params)
-                    use_upgrades = (len(pri_list) > 0 and int(params.get("UPGRADE_CATEGORIA", 0)) == 1)
-                    pri_iter = pri_list if (use_upgrades and int(params.get("TRY_ALL_PRIORITIES", 1)) == 1) else [None]
+                    if pri_list:
+                        techo = max(float(x) for x in pri_list)
+                        ranges_try = [r for r in ranges_try if float(r["MAXIMO"]) <= techo + 1e-6]
 
-                    for target in targets:
-                        candidate_ranges_all = filter_ranges_for_width_target(ranges_try, mixv, target, params)
-                        found = False
-                        for pri in pri_iter:
-                            candidate_ranges = candidate_ranges_all
-                            if pri is not None:
-                                candidate_ranges = ranges_matching_priority(pri, candidate_ranges_all, allow_nearest_higher=True)
+                    # Cantidad de anchos = máximo de MAX_WIDTHS_BY_CAT, nunca objetivo exacto.
+                    candidate_ranges = sorted(ranges_try, key=lambda rr: (-float(rr["MAXIMO"]), str(rr["CATEGORIA"])))
+                    best_seed = None
+                    best_seed_key = None
+                    best_seed_prio = None
 
-                            for r in candidate_ranges:
-                                if capacity_used[r["RANGO_ID"]] >= r["CAPACIDAD"] - 1e-6:
-                                    continue
-                                split_min = params.get("SPLIT_MIN_LBS_ANCHO18", 250) if rule_info.get("regla_aplicada") == "ANCHO18" else float(params.get("SPLIT_MIN_LBS_DEFAULT", 500.0))
-                                intento = intentar_lote_para_rango(
-                                    work, seed_idx, r, capacity_used, params, rule_info,
-                                    require_two_widths=(rule_info.get("regla_aplicada") == "COMBO_ANCHOS"),
-                                    split_min_lbs=split_min,
-                                    min_unique_widths=target,
-                                    max_unique_widths=(target if req_strict else None)
-                                )
-                                if intento is not None:
-                                    lote = intento
-                                    prioridad_obj = float(pri) if pri is not None else None
-                                    found = True
-                                    break
-                            if found:
-                                break
-                        if lote is not None:
-                            break
+                    for r in candidate_ranges:
+                        if capacity_used[r["RANGO_ID"]] >= r["CAPACIDAD"] - 1e-6:
+                            continue
+                        split_min = (params.get("SPLIT_MIN_LBS_ANCHO18", 250)
+                                     if rule_info.get("regla_aplicada") == "ANCHO18"
+                                     else float(params.get("SPLIT_MIN_LBS_DEFAULT", 250.0)))
+                        require_two = rule_info.get("regla_aplicada") == "COMBO_ANCHOS"
+                        intento = intentar_lote_para_rango(
+                            work, seed_idx, r, capacity_used, params, rule_info,
+                            require_two_widths=require_two,
+                            split_min_lbs=split_min,
+                            min_unique_widths=None,
+                            max_unique_widths=None,
+                        )
+                        if intento is None and require_two:
+                            intento = intentar_lote_para_rango(
+                                work, seed_idx, r, capacity_used, params, rule_info,
+                                require_two_widths=False,
+                                split_min_lbs=split_min,
+                                min_unique_widths=None,
+                                max_unique_widths=None,
+                            )
+                        if intento is None:
+                            continue
 
-                    if lote is None:
-                        if use_upgrades:
-                            for pri in pri_iter:
-                                if pri is None:
-                                    continue
-                                candidate_ranges = ranges_matching_priority(pri, ranges_try, allow_nearest_higher=True)
-                                for r in candidate_ranges:
-                                    if capacity_used[r["RANGO_ID"]] >= r["CAPACIDAD"] - 1e-6:
-                                        continue
-                                    split_min = params.get("SPLIT_MIN_LBS_ANCHO18", 250) if rule_info.get("regla_aplicada") == "ANCHO18" else float(params.get("SPLIT_MIN_LBS_DEFAULT", 500.0))
-                                    if rule_info.get("regla_aplicada") == "COMBO_ANCHOS":
-                                        intento = intentar_lote_para_rango(work, seed_idx, r, capacity_used, params, rule_info, require_two_widths=True, split_min_lbs=split_min)
-                                        if intento is None:
-                                            intento = intentar_lote_para_rango(work, seed_idx, r, capacity_used, params, rule_info, require_two_widths=False, split_min_lbs=split_min)
-                                    else:
-                                        intento = intentar_lote_para_rango(work, seed_idx, r, capacity_used, params, rule_info, require_two_widths=False, split_min_lbs=split_min)
-                                    if intento is not None:
-                                        lote = intento
-                                        prioridad_obj = float(pri)
-                                        break
-                                if lote is not None:
-                                    break
+                        maximo_cat = float(intento["MAXIMO"])
+                        total_cat = float(intento["TOTAL_LOTE"])
+                        fill_cat = total_cat / maximo_cat if maximo_cat > 1e-9 else 0.0
+                        perdida_cat = max(0.0, maximo_cat - total_cat)
+                        local_key = (maximo_cat, fill_cat, -perdida_cat)
+                        if best_seed_key is None or local_key > best_seed_key:
+                            best_seed_key = local_key
+                            best_seed = intento
+                            best_seed_prio = max(pri_list) if pri_list else None
 
-                        if lote is None:
-                            for r in ranges_try:
-                                if capacity_used[r["RANGO_ID"]] >= r["CAPACIDAD"] - 1e-6:
-                                    continue
-                                split_min = params.get("SPLIT_MIN_LBS_ANCHO18", 250) if rule_info.get("regla_aplicada") == "ANCHO18" else float(params.get("SPLIT_MIN_LBS_DEFAULT", 500.0))
-                                if rule_info.get("regla_aplicada") == "COMBO_ANCHOS":
-                                    intento = intentar_lote_para_rango(work, seed_idx, r, capacity_used, params, rule_info, require_two_widths=True, split_min_lbs=split_min)
-                                    if intento is None:
-                                        intento = intentar_lote_para_rango(work, seed_idx, r, capacity_used, params, rule_info, require_two_widths=False, split_min_lbs=split_min)
-                                else:
-                                    intento = intentar_lote_para_rango(work, seed_idx, r, capacity_used, params, rule_info, require_two_widths=False, split_min_lbs=split_min)
-                                if intento is not None:
-                                    lote = intento
-                                    break
+                    if best_seed is None:
+                        continue
 
-                    if lote is not None:
-                        resumen_rows = []
-                        for idx, _lbs, *_ in lote["ROWS"]:
-                            resumen_rows.append({
-                                "LNK": work.at[idx, "LNK"],
-                                "ANCHOS_ROW": get_row_widths(work, idx),
-                            })
-                        lote_for_score = {
-                            "MAXIMO": float(lote["MAXIMO"]),
-                            "TOTAL_LOTE": float(lote["TOTAL_LOTE"]),
-                        }
-                        seed_row_dict = work.loc[seed_idx].to_dict()
-                        sc = score_lote(lote_for_score, resumen_rows, params, categoria=lote["CATEGORIA"], seed_row=seed_row_dict)
-                        if sc > best_score:
-                            best_score = sc
-                            best_lote = lote
-                            best_pack = (lote, rule_info, prioridad_obj, best_score)
+                    resumen_rows = []
+                    for idx, _lbs, *_ in best_seed["ROWS"]:
+                        resumen_rows.append({
+                            "LNK": work.at[idx, "LNK"],
+                            "ANCHOS_ROW": get_row_widths(work, idx),
+                        })
+                    lote_for_score = {
+                        "MAXIMO": float(best_seed["MAXIMO"]),
+                        "TOTAL_LOTE": float(best_seed["TOTAL_LOTE"]),
+                    }
+                    seed_row_dict = work.loc[seed_idx].to_dict()
+                    sc = score_lote(lote_for_score, resumen_rows, params,
+                                    categoria=best_seed["CATEGORIA"], seed_row=seed_row_dict)
+                    maximo_cat = float(best_seed["MAXIMO"])
+                    total_cat = float(best_seed["TOTAL_LOTE"])
+                    fill_cat = total_cat / maximo_cat if maximo_cat > 1e-9 else 0.0
+                    perdida_cat = max(0.0, maximo_cat - total_cat)
+                    selection_key = (maximo_cat, fill_cat, -perdida_cat, float(sc))
+                    if best_selection_key is None or selection_key > best_selection_key:
+                        best_selection_key = selection_key
+                        best_lote = best_seed
+                        best_pack = (best_seed, rule_info, best_seed_prio, float(sc))
 
                 if best_lote is None:
                     blocked.add(b)
                     continue
 
                 lote, rule_info, prioridad_obj, best_score = best_pack
-                split_min = params.get("SPLIT_MIN_LBS_ANCHO18", 250) if rule_info.get("regla_aplicada") == "ANCHO18" else float(params.get("SPLIT_MIN_LBS_DEFAULT", 500.0))
+                split_min = params.get("SPLIT_MIN_LBS_ANCHO18", 250) if rule_info.get("regla_aplicada") == "ANCHO18" else float(params.get("SPLIT_MIN_LBS_DEFAULT", 250.0))
 
                 lote_id = f"L{lote_id_global:06d}"
                 lote_id_global += 1
@@ -1117,7 +1104,7 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
 
                     if int(params.get("SCRAP_REMAINDER_BELOW_SPLIT_MIN", 0)) == 1:
                         rem = float(work.at[idx, "LBS_RESTANTES"])
-                        if rem > 1e-9 and rem + 1e-9 < float(split_min):
+                        if rem > 1e-9 and rem < 100.0 - 1e-9:
                             work.at[idx, "LBS_SCRAP"] = float(work.at[idx, "LBS_SCRAP"]) + rem
                             work.at[idx, "LBS_RESTANTES"] = 0.0
 
@@ -1188,7 +1175,7 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
         ["MAX_DIFF_BY_TIPO", str(params.get("MAX_DIFF_BY_TIPO", {}))],
         ["MAX_WIDTHS_BY_CAT", str(params.get("MAX_WIDTHS_BY_CAT", {}))],
         ["MAX_SKU", params["MAX_SKU"]],
-        ["SPLIT_MIN_LBS_DEFAULT", params.get("SPLIT_MIN_LBS_DEFAULT", 500.0)],
+        ["SPLIT_MIN_LBS_DEFAULT", params.get("SPLIT_MIN_LBS_DEFAULT", 250.0)],
         ["SPLIT_MIN_LBS_ANCHO18", params.get("SPLIT_MIN_LBS_ANCHO18", 250)],
         ["RULE_ORDER", params.get("RULE_ORDER", "")],
         ["PRIORITY_ORDER", params.get("PRIORITY_ORDER", "")],
@@ -1198,7 +1185,7 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
         ["ANCHO18_ALLOW_SPILLOVER_2600", params.get("ANCHO18_ALLOW_SPILLOVER_2600", 0)],
         ["ANCHO18_ALLOWED_MAX_DYE", ",".join(sorted(str(int(x)) for x in params.get("ANCHO18_ALLOWED_MAX_DYE", {2200.0, 1100.0})))],
         ["SCRAP_REMAINDER_BELOW_SPLIT_MIN", params.get("SCRAP_REMAINDER_BELOW_SPLIT_MIN", 0)],
-        ["BEAM_WIDTH", params.get("BEAM_WIDTH", 20)],
+        ["BEAM_WIDTH", params.get("BEAM_WIDTH", 12)],
         ["W_FILL", params.get("W_FILL", 5.0)],
         ["W_CAP_LOSS", params.get("W_CAP_LOSS", 3.0)],
         ["WIDTH_PREF_LIST", ",".join(str(x) for x in params.get("WIDTH_PREF_LIST", [4, 3, 2, 1]))],
@@ -1839,7 +1826,7 @@ with tabs[12]:
         params["UPGRADE_CATEGORIA"] = 1 if st.checkbox("UPGRADE_CATEGORIA", value=bool(params["UPGRADE_CATEGORIA"])) else 0
     with c3:
         params["TRY_ALL_PRIORITIES"] = 1 if st.checkbox("TRY_ALL_PRIORITIES", value=bool(params["TRY_ALL_PRIORITIES"])) else 0
-        params["REQUIRE_WIDTHS_STRICT"] = 0 if st.checkbox("REQUIRE_WIDTHS_STRICT", value=bool(params["REQUIRE_WIDTHS_STRICT"])) else 0
+        params["REQUIRE_WIDTHS_STRICT"] = 1 if st.checkbox("REQUIRE_WIDTHS_STRICT", value=bool(params["REQUIRE_WIDTHS_STRICT"])) else 0
         params["WIDTHS_TARGET_ORDER"] = st.text_input("WIDTHS_TARGET_ORDER", value=params["WIDTHS_TARGET_ORDER"])
 
     wpl = st.text_input("WIDTH_PREF_LIST (coma-separado)", value=",".join(str(x) for x in params["WIDTH_PREF_LIST"]))
