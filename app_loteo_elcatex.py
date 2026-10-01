@@ -1077,6 +1077,7 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
                     detalle.append({
                         "LOTE_ID": lote_id,
                         "ANCHOS_LOTE": anchos_lote_str,
+                        "ANCHOS_CANTIDAD": len(anchos_lote),
                         "CATEGORIA": lote["CATEGORIA"],
                         "MIX": lote["MIX"],
                         "TELA.CUERPO": tela,
@@ -1129,6 +1130,7 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
                 resumen.append({
                     "LOTE_ID": lote_id,
                     "ANCHOS_LOTE": anchos_lote_str,
+                    "ANCHOS_CANTIDAD": len(anchos_lote),
                     "CATEGORIA": lote["CATEGORIA"],
                     "MIX": lote["MIX"],
                     "TELA.CUERPO": tela,
@@ -1247,8 +1249,12 @@ def build_reports(df_data, df_cap, df_detalle, df_resumen):
     df_prio_vs_asig["ORD"] = df_prio_vs_asig["BLOQUE"].apply(lambda x: order_blocks.index(x) if x in order_blocks else 999)
     df_prio_vs_asig = df_prio_vs_asig.sort_values(["MIX", "ORD"]).drop(columns=["ORD"])
 
-    df_lnk_base = (df_data.groupby(["MIX", "LNK"], as_index=False)["TOTAL"].sum()
-                    .rename(columns={"TOTAL": "LBS_BASE"}))
+    lnk_extra = [c for c in ["TELA.CUERPO", "ANCHO.F.C", "ANCHO.F.M", "PRIORIDAD", "TIPO_TEJIDO", "PLANTA_COSTURA", "CONSTRUCCION"] if c in df_data.columns]
+    agg_lnk = {"TOTAL": "sum"}
+    for c in lnk_extra:
+        agg_lnk[c] = (lambda x: " | ".join(dict.fromkeys(str(v) for v in x.dropna())) if x.dtype == object else x.dropna().iloc[0] if len(x.dropna()) else np.nan)
+    df_lnk_base = (df_data.groupby(["MIX", "LNK"], as_index=False, dropna=False).agg(agg_lnk)
+                   .rename(columns={"TOTAL": "LBS_BASE"}))
     if "LBS_SCRAP" in df_data.columns:
         df_lnk_scrap = (df_data.groupby(["MIX", "LNK"], as_index=False)["LBS_SCRAP"].sum())
     else:
@@ -1319,6 +1325,79 @@ def build_reports(df_data, df_cap, df_detalle, df_resumen):
         overs = pd.DataFrame({"MIX": [], "LNK": [], "LBS_EXTRA_SOBRE_ORDEN": [], "LBS_ASIGNADAS": []})
         decision_log = pd.DataFrame()
 
+    # Diagnóstico explicable de no asignación. Es una causa probable basada en reglas activas,
+    # no una afirmación absoluta del historial de búsqueda del optimizador.
+    def causa_probable(row):
+        if float(row.get("BALANCE", 0) or 0) <= 1e-6:
+            return "ASIGNADO_COMPLETO"
+        lbs = float(row.get("BALANCE", 0) or 0)
+        ancho_vals = [float(row.get(c, 0) or 0) for c in ["ANCHO.F.C", "ANCHO.F.M"] if pd.notna(row.get(c, None)) and float(row.get(c, 0) or 0) > 0]
+        tejido = up(row.get("TIPO_TEJIDO", ""))
+        min_split = 0.0
+        try:
+            min_split = float(df_param_context.get("SPLIT_MIN_LBS_DEFAULT", 0))
+        except Exception:
+            min_split = 0.0
+        if min_split and lbs < min_split:
+            return "SALDO_MENOR_SPLIT_MINIMO"
+        if not ancho_vals:
+            return "ANCHO_NO_INFORMADO"
+        return "SIN_COMBINACION_FACTIBLE_CON_REGLAS_ACTUALES"
+
+    # Contexto mínimo para el diagnóstico, alimentado desde atributos agregados por run_loteo.
+    df_param_context = getattr(df_data, "attrs", {}).get("LOTEO_PARAMS", {})
+    if len(df_lnk_comp):
+        df_lnk_comp["CAUSA_PROBABLE"] = df_lnk_comp.apply(causa_probable, axis=1)
+        df_causas = (df_lnk_comp[df_lnk_comp["BALANCE"] > 1e-6]
+                     .groupby("CAUSA_PROBABLE", as_index=False)
+                     .agg(LNK_AFECTADOS=("LNK", "nunique"), LBS_NO_ASIGNADAS=("BALANCE", "sum"))
+                     .sort_values("LBS_NO_ASIGNADAS", ascending=False))
+        total_no_asig = float(df_causas["LBS_NO_ASIGNADAS"].sum()) if len(df_causas) else 0.0
+        df_causas["PCT_LBS_NO_ASIGNADAS"] = np.where(total_no_asig > 0, df_causas["LBS_NO_ASIGNADAS"] / total_no_asig, 0.0)
+    else:
+        df_causas = pd.DataFrame(columns=["CAUSA_PROBABLE", "LNK_AFECTADOS", "LBS_NO_ASIGNADAS", "PCT_LBS_NO_ASIGNADAS"])
+
+    # Auditoría objetiva de lotes ya creados contra reglas finales.
+    audit_rows = []
+    if len(df_resumen):
+        for _, lr in df_resumen.iterrows():
+            lote_id = lr.get("LOTE_ID", "")
+            sub = df_detalle[df_detalle["LOTE_ID"] == lote_id] if len(df_detalle) else pd.DataFrame()
+            fallas = []
+            total_lote = float(lr.get("LBS_TOTAL", 0) or 0)
+            minimo = float(lr.get("MIN_RANGO", 0) or 0)
+            maximo = float(lr.get("MAX_RANGO", 0) or 0)
+            if total_lote < minimo - 1e-6: fallas.append("MINIMO_CATEGORIA")
+            if total_lote > maximo + 1e-6: fallas.append("MAXIMO_CATEGORIA")
+            if len(sub):
+                if sub["LNK"].nunique() > int(df_param_context.get("MAX_SKU", 9999)): fallas.append("MAX_SKUS")
+                if "PCT_CARGA" in sub.columns:
+                    pct = float(pd.to_numeric(sub["PCT_CARGA"], errors="coerce").fillna(1).iloc[0])
+                    if total_lote > maximo * pct + 1e-6: fallas.append("PCT_CARGA")
+                anchos = sorted(set(pd.to_numeric(pd.concat([sub.get("ANCHO.F.C", pd.Series(dtype=float)), sub.get("ANCHO.F.M", pd.Series(dtype=float))]), errors="coerce").dropna()))
+                anchos = [float(x) for x in anchos if float(x) > 0]
+                max_anchos = int(df_param_context.get("MAX_WIDTHS_BY_CAT", {}).get(lr.get("CATEGORIA", ""), df_param_context.get("MAX_WIDTHS_DEFAULT", 9999)))
+                if len(anchos) > max_anchos: fallas.append("MAX_CANTIDAD_ANCHOS")
+                tejido = up(sub["TIPO_TEJIDO"].iloc[0]) if "TIPO_TEJIDO" in sub.columns and len(sub) else "OTRO"
+                if tejido not in ("JERSEY", "FLEECE"): tejido = "OTRO"
+                min_d = float(df_param_context.get("MIN_DIFF_BY_TIPO", {}).get(tejido, df_param_context.get("MIN_DIFF", 0)))
+                max_d = float(df_param_context.get("MAX_DIFF_BY_TIPO", {}).get(tejido, df_param_context.get("MAX_DIFF", 999)))
+                for i, a in enumerate(anchos):
+                    for b in anchos[i+1:]:
+                        if abs(b-a) < min_d - 1e-9 or abs(b-a) > max_d + 1e-9: fallas.append("DIFERENCIA_ANCHOS")
+                if "TONO" in sub.columns and sub["TONO"].fillna("").astype(str).nunique() > 1: fallas.append("TONO_MIXTO")
+                bloques_lote = list(sub["BLOQUE"].dropna().astype(str).unique()) if "BLOQUE" in sub.columns else []
+                allowed = df_param_context.get("MIX_ALLOWED", set())
+                for i, b1 in enumerate(bloques_lote):
+                    for b2 in bloques_lote[i+1:]:
+                        if allowed and (b1, b2) not in allowed and (b2, b1) not in allowed:
+                            fallas.append("COMBINACION_PRIORIDAD")
+            audit_rows.append({"LOTE_ID": lote_id, "CATEGORIA": lr.get("CATEGORIA", ""), "MIX": lr.get("MIX", ""),
+                               "LBS_TOTAL": total_lote, "ANCHOS_CANTIDAD": lr.get("ANCHOS_CANTIDAD", lr.get("ANCHOS_UNICOS", 0)),
+                               "ESTADO_VALIDACION": "FALLA" if fallas else "OK",
+                               "REGLAS_FALLIDAS": ", ".join(sorted(set(fallas)))})
+    df_auditoria = pd.DataFrame(audit_rows)
+
     return {
         "CAPACIDAD_X_CATEG": df_cap_cap,
         "PRIORIDAD_VS_ASIG": df_prio_vs_asig,
@@ -1329,32 +1408,112 @@ def build_reports(df_data, df_cap, df_detalle, df_resumen):
         "REGLA_FAMILIA": rep_fam,
         "REPORTE_REGLAS_MIX": rep_maestro,
         "OVERSHOOT_SUMMARY": overs,
-        "DECISION_LOG": decision_log
+        "DECISION_LOG": decision_log,
+        "TOP_CAUSAS_NO_ASIGNACION": df_causas,
+        "AUDITORIA_REGLAS_LOTES": df_auditoria
     }
 
 # ---------------------------- Formatting / export ----------------------------
-def format_workbook(path_xlsx, font_name="Cambria", font_size=8):
+def format_workbook(path_xlsx, font_name="Arial", font_size=9):
     from openpyxl import load_workbook
-    from openpyxl.styles import Font
+    from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
     from openpyxl.utils import get_column_letter
+    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.chart import BarChart, DoughnutChart, Reference
+    from openpyxl.chart.label import DataLabelList
 
     wb = load_workbook(path_xlsx)
-    f = Font(name=font_name, size=font_size)
-    for ws in wb.worksheets:
-        for r in range(1, ws.max_row + 1):
-            for c in range(1, ws.max_column + 1):
-                ws.cell(r, c).font = f
-        for c in range(1, ws.max_column + 1):
-            col = get_column_letter(c)
-            max_len = 0
-            for r in range(1, ws.max_row + 1):
-                v = ws.cell(r, c).value
-                if v is None:
-                    continue
-                max_len = max(max_len, len(str(v)))
-            ws.column_dimensions[col].width = min(max(8, max_len + 2), 60)
-    wb.save(path_xlsx)
+    navy, blue, sky, orange, light, red, white = "082B54", "0072CE", "65B5E8", "F28E2B", "EAF0F6", "C00000", "FFFFFF"
+    thin = Side(style="thin", color="D9E2F2")
+    pct_tokens = ("PCT", "PORC", "FILL_RATE", "%")
 
+    for ws in wb.worksheets:
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        ws.sheet_view.showGridLines = False
+        ws.row_dimensions[1].height = 30
+        headers = {str(c.value).strip(): c.column for c in ws[1] if c.value is not None}
+        for cell in ws[1]:
+            cell.fill = PatternFill("solid", fgColor=navy)
+            cell.font = Font(name=font_name, size=10, bold=True, color=white)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = Border(bottom=Side(style="medium", color=blue))
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.font = Font(name=font_name, size=font_size)
+                cell.border = Border(bottom=thin)
+                cell.alignment = Alignment(vertical="center")
+                header = str(ws.cell(1, cell.column).value or "").upper()
+                if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                    cell.number_format = "0.0%" if any(t in header for t in pct_tokens) else '#,##0;[Red]-#,##0;0'
+        if ws.max_row >= 2 and ws.max_column >= 1:
+            ws.conditional_formatting.add(f"A2:{get_column_letter(ws.max_column)}{ws.max_row}",
+                CellIsRule(operator="lessThan", formula=["0"], font=Font(color=red)))
+        for col_idx in range(1, ws.max_column + 1):
+            values = [str(ws.cell(r, col_idx).value or "") for r in range(1, min(ws.max_row, 500) + 1)]
+            width = min(max(10, max((len(v) for v in values), default=0) + 2), 45)
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+        for r in range(2, ws.max_row + 1):
+            if r % 2 == 0:
+                for c in range(1, ws.max_column + 1):
+                    ws.cell(r, c).fill = PatternFill("solid", fgColor="F7FAFD")
+
+        # Texto de COLOR con relleno aproximado cuando el nombre es reconocible.
+        if ws.title == "DETALLE_LOTES" and "COLOR" in headers:
+            cmap = {"BLACK":"000000", "WHITE":"FFFFFF", "RED":"E53935", "BLUE":"1E88E5", "NAVY":"082B54",
+                    "GREEN":"43A047", "YELLOW":"FDD835", "ORANGE":"FB8C00", "PURPLE":"8E24AA", "PINK":"EC407A",
+                    "GREY":"9E9E9E", "GRAY":"9E9E9E", "BROWN":"795548", "BEIGE":"D7CCC8", "NATURAL":"E8DFC8"}
+            ci = headers["COLOR"]
+            for r in range(2, ws.max_row + 1):
+                txt = str(ws.cell(r, ci).value or "").upper()
+                hit = next((hexv for name, hexv in cmap.items() if name in txt), None)
+                if hit:
+                    ws.cell(r, ci).fill = PatternFill("solid", fgColor=hit)
+                    ws.cell(r, ci).font = Font(name=font_name, size=font_size, color="FFFFFF" if hit in {"000000","082B54","795548","8E24AA"} else "000000")
+
+    # Hoja ejecutiva con gráficos vinculados a tablas del libro.
+    if "DASHBOARD" in wb.sheetnames:
+        del wb["DASHBOARD"]
+    dash = wb.create_sheet("DASHBOARD", 0)
+    dash.sheet_view.showGridLines = False
+    dash["B2"] = "ELCATEX | Resumen ejecutivo de loteo"
+    dash["B2"].font = Font(name=font_name, size=20, bold=True, color=navy)
+    dash.column_dimensions["B"].width = 24
+    for c in range(3, 12): dash.column_dimensions[get_column_letter(c)].width = 14
+
+    if "CAPACIDAD_X_CATEG" in wb.sheetnames:
+        src = wb["CAPACIDAD_X_CATEG"]
+        h = {str(c.value): c.column for c in src[1]}
+        if all(x in h for x in ["CATEGORIA", "CAPACIDAD", "LBS_ASIGNADAS"]):
+            chart = BarChart(); chart.type = "col"; chart.style = 10; chart.title = "Capacidad vs asignado"
+            chart.y_axis.title = "Libras"; chart.x_axis.title = "Categoría"; chart.height = 8; chart.width = 15
+            chart.add_data(Reference(src, min_col=h["CAPACIDAD"], max_col=h["LBS_ASIGNADAS"], min_row=1, max_row=src.max_row), titles_from_data=True)
+            chart.set_categories(Reference(src, min_col=h["CATEGORIA"], min_row=2, max_row=src.max_row))
+            dash.add_chart(chart, "B5")
+    if "TOP_CAUSAS_NO_ASIGNACION" in wb.sheetnames:
+        src = wb["TOP_CAUSAS_NO_ASIGNACION"]
+        h = {str(c.value): c.column for c in src[1]}
+        if src.max_row > 1 and all(x in h for x in ["CAUSA_PROBABLE", "LBS_NO_ASIGNADAS"]):
+            chart = BarChart(); chart.type = "bar"; chart.style = 10; chart.title = "Top causas probables de no asignación"
+            chart.height = 8; chart.width = 15
+            chart.add_data(Reference(src, min_col=h["LBS_NO_ASIGNADAS"], min_row=1, max_row=src.max_row), titles_from_data=True)
+            chart.set_categories(Reference(src, min_col=h["CAUSA_PROBABLE"], min_row=2, max_row=src.max_row))
+            dash.add_chart(chart, "J5")
+    if "LNK_COMPLETITUD" in wb.sheetnames:
+        src = wb["LNK_COMPLETITUD"]
+        h = {str(c.value): c.column for c in src[1]}
+        if "ESTADO" in h:
+            counts = {}
+            for r in range(2, src.max_row + 1): counts[str(src.cell(r, h["ESTADO"]).value)] = counts.get(str(src.cell(r, h["ESTADO"]).value), 0) + 1
+            dash["B23"], dash["C23"] = "ESTADO", "LNK"
+            for i, (k, v) in enumerate(counts.items(), 24): dash.cell(i,2,k); dash.cell(i,3,v)
+            if counts:
+                chart = DoughnutChart(); chart.title = "Completitud LNK"; chart.height = 7; chart.width = 10
+                chart.add_data(Reference(dash, min_col=3, min_row=23, max_row=23+len(counts)), titles_from_data=True)
+                chart.set_categories(Reference(dash, min_col=2, min_row=24, max_row=23+len(counts)))
+                chart.dataLabels = DataLabelList(); chart.dataLabels.showPercent = True
+                dash.add_chart(chart, "B25")
+    wb.save(path_xlsx)
 
 # ============================================
 # app.py — App Streamlit de Loteo de Tintorería (NV2)
@@ -1728,6 +1887,7 @@ if st.button("▶️ Ejecutar Loteo", type="primary"):
                 progress_bar.progress(min(1.0, frac), text=msg)
 
             with st.spinner("Ejecutando algoritmo de loteo..."):
+                st.session_state.get("df_data_filtrada", st.session_state["df_data"]).attrs["LOTEO_PARAMS"] = params
                 df_detalle, df_resumen, df_exced, df_param_out = run_loteo(
                     st.session_state.get("df_data_filtrada", st.session_state["df_data"]), df_cap_final, params, progress_cb=cb
                 )
@@ -1759,11 +1919,12 @@ if st.session_state["resultado"] is not None:
     lbs_excedentes = float(df_exced["LBS_RESTANTES"].sum()) if len(df_exced) else 0.0
     fill_avg = float(reports["CAPACIDAD_X_CATEG"]["FILL_RATE"].mean()) * 100 if len(reports["CAPACIDAD_X_CATEG"]) else 0.0
 
+    pct_sin_asignar = (lbs_excedentes / total_data * 100) if total_data > 0 else 0.0
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("% lbs asignadas", f"{pct_asignado:.1f}%")
-    k2.metric("# Lotes creados", f"{n_lotes}")
-    k3.metric("# SKUs sin asignar", f"{skus_sin_asignar}")
-    k4.metric("Lbs en excedentes", f"{lbs_excedentes:,.0f}")
+    k1.metric("Total libras", f"{total_data:,.0f}")
+    k2.metric("Libras asignadas", f"{total_asignado:,.0f}", f"{pct_asignado:.1f}% del total")
+    k3.metric("Libras sin asignar", f"{lbs_excedentes:,.0f}", f"{pct_sin_asignar:.1f}% del total", delta_color="inverse")
+    k4.metric("Lotes creados", f"{n_lotes:,}")
     k5.metric("Fill rate promedio", f"{fill_avg:.1f}%")
 
     st.subheader("Resumen ejecutivo")
@@ -1794,7 +1955,8 @@ if st.session_state["resultado"] is not None:
         "DETALLE_LOTES", "RESUMEN_LOTES", "EXCEDENTES", "PARAMETROS",
         "CAPACIDAD_X_CATEG", "PRIORIDAD_VS_ASIG", "LNK_COMPLETITUD",
         "REGLA_STYLE_ANCHO18", "REGLA_COMBINACION_ANCHOS", "REGLA_COLOR_R",
-        "REGLA_FAMILIA", "REPORTE_REGLAS_MIX", "OVERSHOOT_SUMMARY", "DECISION_LOG"
+        "REGLA_FAMILIA", "REPORTE_REGLAS_MIX", "OVERSHOOT_SUMMARY", "DECISION_LOG",
+        "TOP_CAUSAS_NO_ASIGNACION", "AUDITORIA_REGLAS_LOTES"
     ])
     all_reports = {
         "DETALLE_LOTES": df_detalle, "RESUMEN_LOTES": df_resumen, "EXCEDENTES": df_exced,
@@ -1909,7 +2071,7 @@ if st.session_state["resultado"] is not None:
                         if df_safe[col].dtype == object:
                             df_safe[col] = df_safe[col].apply(lambda v: v if (v is None or isinstance(v, (str, int, float, bool))) else str(v))
                     df_safe.to_excel(writer, index=False, sheet_name=sheet_name)
-            format_workbook(out_path, font_name="Cambria", font_size=8)
+            format_workbook(out_path, font_name="Arial", font_size=9)
             with open(out_path, "rb") as f:
                 st.session_state["excel_bytes"] = f.read()
             st.success("✅ Excel generado. Usa el botón de abajo para descargarlo.")
