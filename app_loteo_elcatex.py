@@ -1202,6 +1202,7 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
         ["PRIORIDAD_GRANDES_ENABLE", params.get("PRIORIDAD_GRANDES_ENABLE", 1)],
         ["PRIORIDAD_GRANDES_CATEGORIAS", ",".join(params.get("PRIORIDAD_GRANDES_CATEGORIAS", ["A-4000", "B-3300"]))],
         ["PRIORIDAD_GRANDES_FALLBACK", ",".join(params.get("PRIORIDAD_GRANDES_FALLBACK", ["DUE", "AHEAD"]))],
+        ["COLOR_R_RESTRINGIDOS", ",".join(sorted(params.get("RESTRICCIONES_COLOR", {}).keys()))],
     ], columns=["PARAMETRO", "VALOR"])
 
     return df_detalle, df_resumen, exced, df_param_out
@@ -1667,12 +1668,20 @@ with tabs[1]:
     st.markdown("La restricción de color aplica a todos los estilos (TODOS), en la categoría seleccionada (MAXIMO) y hacia abajo.")
     on = st.checkbox("Activar RESTRICCION_COLOR", value=params["RULE_TOGGLES"]["RESTRICCION_COLOR"], key="t_color")
     params["RULE_TOGGLES"]["RESTRICCION_COLOR"] = on
-    default_cap = params["RESTRICCIONES_COLOR"].get("TODOS", 2600.0)
-    cap_val = st.number_input("MAXIMO de categoría para todos los COLOR_R", value=float(default_cap), step=100.0, key="color_cap")
+    default_cap = params["RESTRICCIONES_COLOR"].get("RESTRICCION", params["RESTRICCIONES_COLOR"].get("TODOS", 2600.0))
+    cap_val = st.number_input("MAXIMO para registros marcados como RESTRICCION en COLOR_R", value=float(default_cap), step=100.0, key="color_cap")
     if on and st.session_state["df_data"] is not None and "COLOR_R" in st.session_state["df_data"].columns:
-        colores = sorted([c for c in st.session_state["df_data"]["COLOR_R"].unique() if c])
-        params["RESTRICCIONES_COLOR"] = {c: cap_val for c in colores}
-        st.caption(f"Se aplicará a {len(colores)} valores distintos de COLOR_R encontrados en DATA: {colores[:10]}{'...' if len(colores) > 10 else ''}")
+        # COLOR_R es un marcador operativo. Solo valores que indiquen RESTRICCION
+        # deben limitarse a 2600 y hacia abajo; NORMAL y demás valores quedan libres.
+        marcadores = sorted({
+            up(v) for v in st.session_state["df_data"]["COLOR_R"].dropna().unique()
+            if "RESTRICC" in up(v)
+        })
+        params["RESTRICCIONES_COLOR"] = {m: cap_val for m in marcadores}
+        if marcadores:
+            st.caption(f"La regla se aplicará únicamente a COLOR_R marcado como restricción: {marcadores}")
+        else:
+            st.caption("No se encontraron registros COLOR_R marcados como RESTRICCION; la regla no limitará categorías.")
     else:
         params["RESTRICCIONES_COLOR"] = {}
 
