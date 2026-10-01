@@ -1249,7 +1249,7 @@ def build_reports(df_data, df_cap, df_detalle, df_resumen):
     df_prio_vs_asig["ORD"] = df_prio_vs_asig["BLOQUE"].apply(lambda x: order_blocks.index(x) if x in order_blocks else 999)
     df_prio_vs_asig = df_prio_vs_asig.sort_values(["MIX", "ORD"]).drop(columns=["ORD"])
 
-    lnk_extra = [c for c in ["TELA.CUERPO", "ANCHO.F.C", "ANCHO.F.M", "PRIORIDAD", "TIPO_TEJIDO", "PLANTA_COSTURA", "CONSTRUCCION"] if c in df_data.columns]
+    lnk_extra = [c for c in ["TELA.CUERPO", "COLOR", "TONO", "ANCHO.F.C", "ANCHO.F.M", "PRIORIDAD", "TIPO_TEJIDO", "PLANTA_COSTURA", "CONSTRUCCION"] if c in df_data.columns]
     agg_lnk = {"TOTAL": "sum"}
     for c in lnk_extra:
         agg_lnk[c] = (lambda x: " | ".join(dict.fromkeys(str(v) for v in x.dropna())) if x.dtype == object else x.dropna().iloc[0] if len(x.dropna()) else np.nan)
