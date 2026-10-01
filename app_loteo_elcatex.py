@@ -22,7 +22,10 @@ DEFAULT_MAX_WIDTHS_BY_CAT = {
 # COMBINACION_PRIORIDAD: PAST DUE+DUE(VENCIDOS), +AHEAD, AHEAD+AHEAD2, OTROS solo con AHEAD2.
 DEFAULT_ALLOWED_PAIRS = [
     ("VENCIDOS", "VENCIDOS"),
+    ("VENCIDOS", "DUE"),
     ("VENCIDOS", "AHEAD"),
+    ("DUE", "DUE"),
+    ("DUE", "AHEAD"),
     ("AHEAD", "AHEAD"),
     ("AHEAD", "AHEAD2"),
     ("OTROS", "AHEAD2"),
@@ -176,15 +179,15 @@ def parse_reglas_operativas(xlsm_path):
     params_default = {
         "MIN_DIFF": obs_minimo_ancho if obs_minimo_ancho is not None else 1.0,
         "MAX_DIFF": obs_maximo_ancho if obs_maximo_ancho is not None else 6.0,
-        "MIN_DIFF_BY_TIPO": {"JERSEY": obs_minimo_ancho if obs_minimo_ancho is not None else 1.0, "FLEECE": obs_minimo_ancho if obs_minimo_ancho is not None else 1.0, "OTRO": obs_minimo_ancho if obs_minimo_ancho is not None else 1.0},
-        "MAX_DIFF_BY_TIPO": {"JERSEY": obs_maximo_ancho if obs_maximo_ancho is not None else 6.0, "FLEECE": obs_maximo_ancho if obs_maximo_ancho is not None else 6.0, "OTRO": obs_maximo_ancho if obs_maximo_ancho is not None else 6.0},
+        "MIN_DIFF_BY_TIPO": {"JERSEY": 1.5, "FLEECE": 1.0, "OTRO": obs_minimo_ancho if obs_minimo_ancho is not None else 1.0},
+        "MAX_DIFF_BY_TIPO": {"JERSEY": 6.0, "FLEECE": 7.0, "OTRO": obs_maximo_ancho if obs_maximo_ancho is not None else 6.0},
         "MAX_SKU": int(obs_max_skus) if obs_max_skus is not None else 6,
         "MAX_WIDTHS_BY_CAT": dict(DEFAULT_MAX_WIDTHS_BY_CAT),
         "MAX_WIDTHS_DEFAULT": 4,
 
         "SPLIT_MIN_LBS_DEFAULT": obs_split_minimo if obs_split_minimo is not None else 500.0,
         "SPLIT_MIN_LBS_ANCHO18": 250.0,
-        "SCRAP_REMAINDER_BELOW_SPLIT_MIN": 1,
+        "SCRAP_REMAINDER_BELOW_SPLIT_MIN": 0,
 
         "RESTRICCIONES_FAMILIA": restr_fam,
         "RESTRICCIONES_COLOR": restr_color,
@@ -214,8 +217,8 @@ def parse_reglas_operativas(xlsm_path):
 
         "WIDTHS_TARGET_ORDER": "4>3>2>1",
         "REQUIRE_WIDTHS_STRICT": 1,
-        "ALLOWED_MAXIMO_FOR_3_WIDTHS": {"DYE": {2200.0, 2600.0}, "BLEACH": set()},
-        "ALLOWED_MAXIMO_FOR_4_WIDTHS": {"DYE": {2600.0}, "BLEACH": set()},
+        "ALLOWED_MAXIMO_FOR_3_WIDTHS": {"DYE": {4000.0, 3300.0, 2600.0, 2200.0}, "BLEACH": set()},
+        "ALLOWED_MAXIMO_FOR_4_WIDTHS": {"DYE": {4000.0, 3300.0, 2600.0, 2200.0}, "BLEACH": set()},
 
         # TIPO_TEJIDO (nuevo)
         "TIPO_TEJIDO_ENABLE": 1,
@@ -311,13 +314,24 @@ def read_sheet_autoheader(xlsm_path, sheet_name, required_cols=None, default_hea
 
 # ---------------------------- Blocks & Widths ----------------------------
 def prioridad_bloque(prio_text: str) -> str:
-    p = (prio_text or "").upper()
-    if "PAST DUE" in p or "DUE" in p or "VENC" in p:
+    """Normaliza prioridad sin absorber AHEAD/AHEAD2 dentro de DUE.
+
+    Precedencia intencional:
+      1) PAST DUE / VENCIDO -> VENCIDOS
+      2) AHEAD2             -> AHEAD2
+      3) AHEAD              -> AHEAD
+      4) DUE                -> DUE
+      5) resto              -> OTROS
+    """
+    p = re.sub(r"[\s_\-]+", " ", up(prio_text)).strip()
+    if re.search(r"\bPAST\s+DUE\b|\bVENCID[OA]S?\b|\bOVERDUE\b", p):
         return "VENCIDOS"
-    if "AHEAD2" in p:
+    if re.search(r"\bAHEAD\s*2\b", p):
         return "AHEAD2"
-    if "AHEAD" in p:
+    if re.search(r"\bAHEAD\b", p):
         return "AHEAD"
+    if re.search(r"\bDUE\b", p):
+        return "DUE"
     return "OTROS"
 
 def can_mix_blocks(b1, b2, allowed_pairs):
@@ -631,7 +645,7 @@ def score_lote(lote_dict, resumen_rows, params, categoria=None, seed_row=None):
     total = float(lote_dict.get("TOTAL_LOTE", 0.0))
     maximo = float(lote_dict.get("MAXIMO", 1.0))
     fill = total / maximo if maximo > 1e-9 else 0.0
-    cap_loss = (maximo - total)
+    cap_loss = max(0.0, (maximo - total) / maximo) if maximo > 1e-9 else 1.0
 
     anchos = set()
     for r in resumen_rows:
@@ -685,6 +699,8 @@ def intentar_lote_para_rango(work, seed_idx, rango, capacity_used, params, rule_
         tejido_seed = "OTRO"
     min_diff = float(params.get("MIN_DIFF_BY_TIPO", {}).get(tejido_seed, params["MIN_DIFF"]))
     max_diff = float(params.get("MAX_DIFF_BY_TIPO", {}).get(tejido_seed, params["MAX_DIFF"]))
+    if not bool(params.get("RULE_TOGGLES", {}).get("MIN_MAX_ANCHO", True)):
+        min_diff, max_diff = 0.0, float("inf")
     max_sku = params["MAX_SKU"]
     allowed_pairs = params["MIX_ALLOWED"]
 
@@ -718,7 +734,7 @@ def intentar_lote_para_rango(work, seed_idx, rango, capacity_used, params, rule_
         split_min_lbs = float(split_min_lbs if split_min_lbs is not None else params.get("SPLIT_MIN_LBS_DEFAULT", 500.0))
     except Exception:
         split_min_lbs = float(params.get("SPLIT_MIN_LBS_DEFAULT", 500.0))
-    allow_scrap_residue = int(params.get("SCRAP_REMAINDER_BELOW_SPLIT_MIN", 1)) == 1
+    allow_scrap_residue = int(params.get("SCRAP_REMAINDER_BELOW_SPLIT_MIN", 0)) == 1
 
     lote_rows = []
     lote_lbs = 0.0
@@ -741,6 +757,16 @@ def intentar_lote_para_rango(work, seed_idx, rango, capacity_used, params, rule_
             return False
 
         b = work.at[idx, "BLOQUE"]
+        # Categorías grandes con semilla VENCIDOS:
+        # primero se intenta lote vencido puro; si no alcanza, se habilita DUE y luego AHEAD.
+        if (int(params.get("PRIORIDAD_GRANDES_ENABLE", 1)) == 1
+                and rango["CATEGORIA"] in set(params.get("PRIORIDAD_GRANDES_CATEGORIAS", ["A-4000", "B-3300"]))
+                and lote_blocks and lote_blocks[0] == "VENCIDOS"):
+            fallback = list(params.get("PRIORIDAD_GRANDES_FALLBACK", ["DUE", "AHEAD"]))
+            etapa = prioridad_grandes_etapa
+            permitidos = {"VENCIDOS"} | set(fallback[:etapa])
+            if b not in permitidos:
+                return False
         for existing_b in lote_blocks:
             if not can_mix_blocks(existing_b, b, allowed_pairs):
                 return False
@@ -772,6 +798,7 @@ def intentar_lote_para_rango(work, seed_idx, rango, capacity_used, params, rule_
     lote_widths += get_row_widths(work, seed_idx)
 
     combo_target = rule_info.get("combo_target_width", None) if rule_info else None
+    prioridad_grandes_etapa = 0
 
     while True:
         remaining = max_allowed - lote_lbs
@@ -851,6 +878,7 @@ def intentar_lote_para_rango(work, seed_idx, rango, capacity_used, params, rule_
         "ROWS": lote_rows,
         "REQUIERE_2_ANCHOS": bool(require_two_widths),
         "PCT_CARGA_USADO": pct_carga_seed,
+        "PRIORIDAD_GRANDES_ETAPA": prioridad_grandes_etapa,
     }
 
 # ---------------------------- Loteo principal ----------------------------
@@ -868,7 +896,8 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
     resumen = []
     lote_id_global = 1
 
-    block_order = ["VENCIDOS", "AHEAD", "AHEAD2", "OTROS"]
+    # Secuencia de negocio: semilla vencida pura; luego DUE; después AHEAD.
+    block_order = ["VENCIDOS", "DUE", "AHEAD", "AHEAD2", "OTROS"]
 
     group_keys = ["TELA.CUERPO", "MIX"]
     if "TONO" in data.columns:
@@ -1085,7 +1114,7 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
                     new_rest = prev_rest - float(lbs_asig)
                     work.at[idx, "LBS_RESTANTES"] = max(0.0, new_rest)
 
-                    if int(params.get("SCRAP_REMAINDER_BELOW_SPLIT_MIN", 1)) == 1:
+                    if int(params.get("SCRAP_REMAINDER_BELOW_SPLIT_MIN", 0)) == 1:
                         rem = float(work.at[idx, "LBS_RESTANTES"])
                         if rem > 1e-9 and rem + 1e-9 < float(split_min):
                             work.at[idx, "LBS_SCRAP"] = float(work.at[idx, "LBS_SCRAP"]) + rem
@@ -1094,7 +1123,8 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
                 det_lote = [d for d in detalle if d["LOTE_ID"] == lote_id]
                 lnks = {d["LNK"] for d in det_lote}
                 bloques = [d["BLOQUE"] for d in det_lote]
-                bloque_dom = max(set(bloques), key=bloques.count) if bloques else ""
+                orden_bloque_dom = {"VENCIDOS": 0, "DUE": 1, "AHEAD": 2, "AHEAD2": 3, "OTROS": 4}
+                bloque_dom = min(set(bloques), key=lambda x: (-bloques.count(x), orden_bloque_dom.get(x, 999))) if bloques else ""
 
                 resumen.append({
                     "LOTE_ID": lote_id,
@@ -1110,6 +1140,8 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
                     "SKU_DISTINTOS": len(lnks),
                     "ANCHOS_UNICOS": len(anchos_lote),
                     "BLOQUE_DOMINANTE": bloque_dom,
+                    "BLOQUES_LOTE": ",".join(sorted(set(bloques))),
+                    "FALLBACK_PRIORIDAD_GRANDE": int(lote.get("PRIORIDAD_GRANDES_ETAPA", 0)),
                     "REGLA_DOMINANTE": regla_aplicada_final,
                     "PRIORIDAD_FINAL": prioridad_final,
                     "PRIORIDAD_OBJETIVO": prioridad_obj,
@@ -1150,6 +1182,8 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
     df_param_out = pd.DataFrame([
         ["MIN_DIFF", params["MIN_DIFF"]],
         ["MAX_DIFF", params["MAX_DIFF"]],
+        ["MIN_DIFF_BY_TIPO", str(params.get("MIN_DIFF_BY_TIPO", {}))],
+        ["MAX_DIFF_BY_TIPO", str(params.get("MAX_DIFF_BY_TIPO", {}))],
         ["MAX_WIDTHS_BY_CAT", str(params.get("MAX_WIDTHS_BY_CAT", {}))],
         ["MAX_SKU", params["MAX_SKU"]],
         ["SPLIT_MIN_LBS_DEFAULT", params.get("SPLIT_MIN_LBS_DEFAULT", 500.0)],
@@ -1161,7 +1195,7 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
         ["UPGRADE_CATEGORIA", params.get("UPGRADE_CATEGORIA", 0)],
         ["ANCHO18_ALLOW_SPILLOVER_2600", params.get("ANCHO18_ALLOW_SPILLOVER_2600", 0)],
         ["ANCHO18_ALLOWED_MAX_DYE", ",".join(sorted(str(int(x)) for x in params.get("ANCHO18_ALLOWED_MAX_DYE", {2200.0, 1100.0})))],
-        ["SCRAP_REMAINDER_BELOW_SPLIT_MIN", params.get("SCRAP_REMAINDER_BELOW_SPLIT_MIN", 1)],
+        ["SCRAP_REMAINDER_BELOW_SPLIT_MIN", params.get("SCRAP_REMAINDER_BELOW_SPLIT_MIN", 0)],
         ["BEAM_WIDTH", params.get("BEAM_WIDTH", 3)],
         ["W_FILL", params.get("W_FILL", 5.0)],
         ["W_CAP_LOSS", params.get("W_CAP_LOSS", 3.0)],
@@ -1170,12 +1204,15 @@ def run_loteo(df_data, df_cap, params, progress_cb=None):
         ["W_1100_WIDTHS_STRICT", params.get("W_1100_WIDTHS_STRICT", 10.0)],
         ["WIDTHS_TARGET_ORDER", params.get("WIDTHS_TARGET_ORDER", "4>3>2>1")],
         ["REQUIRE_WIDTHS_STRICT", params.get("REQUIRE_WIDTHS_STRICT", 1)],
-        ["ALLOWED_MAXIMO_FOR_3_WIDTHS_DYE", ",".join(str(int(x)) for x in params.get("ALLOWED_MAXIMO_FOR_3_WIDTHS", {}).get("DYE", set()))],
-        ["ALLOWED_MAXIMO_FOR_4_WIDTHS_DYE", ",".join(str(int(x)) for x in params.get("ALLOWED_MAXIMO_FOR_4_WIDTHS", {}).get("DYE", set()))],
-        ["ALLOWED_MAXIMO_FOR_3_WIDTHS_BLEACH", ",".join(str(int(x)) for x in params.get("ALLOWED_MAXIMO_FOR_3_WIDTHS", {}).get("BLEACH", set()))],
-        ["ALLOWED_MAXIMO_FOR_4_WIDTHS_BLEACH", ",".join(str(int(x)) for x in params.get("ALLOWED_MAXIMO_FOR_4_WIDTHS", {}).get("BLEACH", set()))],
+        ["ALLOWED_MAXIMO_FOR_3_WIDTHS_DYE", ",".join(str(int(x)) for x in sorted(params.get("ALLOWED_MAXIMO_FOR_3_WIDTHS", {}).get("DYE", set()), reverse=True))],
+        ["ALLOWED_MAXIMO_FOR_4_WIDTHS_DYE", ",".join(str(int(x)) for x in sorted(params.get("ALLOWED_MAXIMO_FOR_4_WIDTHS", {}).get("DYE", set()), reverse=True))],
+        ["ALLOWED_MAXIMO_FOR_3_WIDTHS_BLEACH", ",".join(str(int(x)) for x in sorted(params.get("ALLOWED_MAXIMO_FOR_3_WIDTHS", {}).get("BLEACH", set()), reverse=True))],
+        ["ALLOWED_MAXIMO_FOR_4_WIDTHS_BLEACH", ",".join(str(int(x)) for x in sorted(params.get("ALLOWED_MAXIMO_FOR_4_WIDTHS", {}).get("BLEACH", set()), reverse=True))],
         ["TIPO_TEJIDO_ENABLE", params.get("TIPO_TEJIDO_ENABLE", 0)],
         ["W_TIPO_TEJIDO_FLEECE", params.get("W_TIPO_TEJIDO_FLEECE", 4.0)],
+        ["PRIORIDAD_GRANDES_ENABLE", params.get("PRIORIDAD_GRANDES_ENABLE", 1)],
+        ["PRIORIDAD_GRANDES_CATEGORIAS", ",".join(params.get("PRIORIDAD_GRANDES_CATEGORIAS", ["A-4000", "B-3300"]))],
+        ["PRIORIDAD_GRANDES_FALLBACK", ",".join(params.get("PRIORIDAD_GRANDES_FALLBACK", ["DUE", "AHEAD"]))],
     ], columns=["PARAMETRO", "VALOR"])
 
     return df_detalle, df_resumen, exced, df_param_out
@@ -1206,7 +1243,7 @@ def build_reports(df_data, df_cap, df_detalle, df_resumen):
     df_prio_vs_asig = (df_prio_base.merge(df_prio_asig, on=["MIX", "BLOQUE"], how="left")
                         .fillna({"LBS_ASIGNADAS": 0.0}))
     df_prio_vs_asig["LBS_SIN_ASIGNAR"] = df_prio_vs_asig["LBS_BASE"] - df_prio_vs_asig["LBS_ASIGNADAS"]
-    order_blocks = ["VENCIDOS", "AHEAD", "AHEAD2", "OTROS"]
+    order_blocks = ["VENCIDOS", "DUE", "AHEAD", "AHEAD2", "OTROS"]
     df_prio_vs_asig["ORD"] = df_prio_vs_asig["BLOQUE"].apply(lambda x: order_blocks.index(x) if x in order_blocks else 999)
     df_prio_vs_asig = df_prio_vs_asig.sort_values(["MIX", "ORD"]).drop(columns=["ORD"])
 
@@ -1551,7 +1588,7 @@ with tabs[5]:
     st.markdown("Matriz de bloques que pueden mezclarse en un mismo lote (PAST DUE+DUE=VENCIDOS, AHEAD, AHEAD2, OTROS):")
     on = st.checkbox("Activar COMBINACION_PRIORIDAD", value=params["RULE_TOGGLES"]["COMBINACION_PRIORIDAD"], key="t_combo")
     params["RULE_TOGGLES"]["COMBINACION_PRIORIDAD"] = on
-    blocks = ["VENCIDOS", "AHEAD", "AHEAD2", "OTROS"]
+    blocks = ["VENCIDOS", "DUE", "AHEAD", "AHEAD2", "OTROS"]
     default_pairs = set(params["ALLOWED_PAIRS"])
     selected_pairs = []
     st.caption("Marca los pares que se pueden mezclar (la diagonal, mismo bloque, siempre se permite).")
@@ -1696,13 +1733,14 @@ if st.button("▶️ Ejecutar Loteo", type="primary"):
                 )
                 reports = build_reports(st.session_state.get("df_data_filtrada", st.session_state["df_data"]), df_cap_final, df_detalle, df_resumen)
 
+            st.session_state["excel_bytes"] = None
             st.session_state["resultado"] = {
                 "df_detalle": df_detalle, "df_resumen": df_resumen, "df_exced": df_exced,
                 "df_param_out": df_param_out, "reports": reports, "df_cap_final": df_cap_final
             }
             st.success(f"✅ Loteo completado: {len(df_resumen)} lotes creados.")
         except Exception as e:
-            st.error(f"❌ Error durante la ejecución del loteo: {e}")
+            st.exception(e)
 
 # ---------------------------- 4 & 5. Resultados y gráficos ----------------------------
 if st.session_state["resultado"] is not None:
@@ -1769,42 +1807,82 @@ if st.session_state["resultado"] is not None:
             st.download_button(f"⬇️ Descargar {name}.csv", data=df.to_csv(index=False).encode("utf-8"),
                                 file_name=f"{name}.csv", mime="text/csv", key=f"dl_{name}")
 
-    st.header("6. Gráficos")
+    st.header("6. Tablero ejecutivo")
+    ELC_BLUE, ELC_NAVY, ELC_SKY, ELC_ORANGE, ELC_GRAY = "#0072CE", "#082B54", "#65B5E8", "#F28E2B", "#D9E2F2"
+    def estilo_ejecutivo(fig, titulo, altura=430):
+        fig.update_layout(
+            title=dict(text=titulo, x=0.02, xanchor="left", font=dict(size=19, color=ELC_NAVY)),
+            template="plotly_white", height=altura, margin=dict(l=35, r=25, t=70, b=45),
+            font=dict(family="Arial", size=12, color="#243447"),
+            paper_bgcolor="white", plot_bgcolor="white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hoverlabel=dict(bgcolor="white", font_size=12, font_family="Arial")
+        )
+        fig.update_xaxes(showgrid=False, linecolor="#D9E2F2")
+        fig.update_yaxes(gridcolor="#EAF0F6", zeroline=False)
+        return fig
 
-    if len(reports["CAPACIDAD_X_CATEG"]) > 0:
-        df_c = reports["CAPACIDAD_X_CATEG"]
-        fig = go.Figure()
-        fig.add_bar(x=df_c["CATEGORIA"] + " (" + df_c["MIX"] + ")", y=df_c["CAPACIDAD"], name="Capacidad")
-        fig.add_bar(x=df_c["CATEGORIA"] + " (" + df_c["MIX"] + ")", y=df_c["LBS_ASIGNADAS"], name="Asignado")
-        fig.add_trace(go.Scatter(x=df_c["CATEGORIA"] + " (" + df_c["MIX"] + ")", y=df_c["FILL_RATE"] * 100,
-                                  name="% Llenado", yaxis="y2", mode="lines+markers"))
-        fig.update_layout(barmode="group", title="Capacidad vs. Asignado por categoría",
-                           yaxis2=dict(overlaying="y", side="right", title="% Llenado"))
-        st.plotly_chart(fig, use_container_width=True)
+    g1, g2 = st.columns(2)
+    with g1:
+        if len(reports["CAPACIDAD_X_CATEG"]):
+            dc = reports["CAPACIDAD_X_CATEG"].copy()
+            dc["ETIQUETA"] = dc["CATEGORIA"] + " · " + dc["MIX"]
+            fig = go.Figure()
+            fig.add_bar(x=dc["ETIQUETA"], y=dc["CAPACIDAD"], name="Capacidad", marker_color=ELC_GRAY,
+                        hovertemplate="%{x}<br>Capacidad: %{y:,.0f} lb<extra></extra>")
+            fig.add_bar(x=dc["ETIQUETA"], y=dc["LBS_ASIGNADAS"], name="Asignado", marker_color=ELC_BLUE,
+                        text=dc["FILL_RATE"].map(lambda x: f"{x:.0%}"), textposition="outside",
+                        hovertemplate="%{x}<br>Asignado: %{y:,.0f} lb<extra></extra>")
+            fig.update_layout(barmode="group")
+            st.plotly_chart(estilo_ejecutivo(fig, "Utilización de capacidad por categoría"), use_container_width=True)
+    with g2:
+        if len(reports["PRIORIDAD_VS_ASIG"]):
+            dp = reports["PRIORIDAD_VS_ASIG"].copy()
+            orden = ["VENCIDOS", "DUE", "AHEAD", "AHEAD2", "OTROS"]
+            dp["BLOQUE"] = pd.Categorical(dp["BLOQUE"], categories=orden, ordered=True)
+            dp = dp.sort_values(["MIX", "BLOQUE"])
+            fig = go.Figure()
+            fig.add_bar(x=dp["BLOQUE"].astype(str), y=dp["LBS_ASIGNADAS"], name="Asignadas", marker_color=ELC_BLUE,
+                        hovertemplate="%{x}<br>Asignadas: %{y:,.0f} lb<extra></extra>")
+            fig.add_bar(x=dp["BLOQUE"].astype(str), y=dp["LBS_SIN_ASIGNAR"], name="Pendientes", marker_color=ELC_ORANGE,
+                        hovertemplate="%{x}<br>Pendientes: %{y:,.0f} lb<extra></extra>")
+            fig.update_layout(barmode="stack")
+            st.plotly_chart(estilo_ejecutivo(fig, "Cobertura por bloque de prioridad"), use_container_width=True)
 
-    if len(reports["PRIORIDAD_VS_ASIG"]) > 0:
-        df_p = reports["PRIORIDAD_VS_ASIG"]
-        fig2 = px.bar(df_p, x="BLOQUE", y=["LBS_ASIGNADAS", "LBS_SIN_ASIGNAR"], facet_col="MIX", barmode="stack",
-                      title="Prioridad/bloque: lbs asignadas vs. sin asignar")
-        st.plotly_chart(fig2, use_container_width=True)
+    g3, g4 = st.columns(2)
+    with g3:
+        if len(df_resumen):
+            dw = df_resumen["ANCHOS_UNICOS"].value_counts().sort_index().rename_axis("ANCHOS").reset_index(name="LOTES")
+            fig = px.bar(dw, x="ANCHOS", y="LOTES", text="LOTES", color="ANCHOS",
+                         color_continuous_scale=[[0, ELC_SKY], [1, ELC_NAVY]])
+            fig.update_traces(textposition="outside", hovertemplate="%{x} anchos<br>%{y} lotes<extra></extra>")
+            fig.update_layout(coloraxis_showscale=False)
+            st.plotly_chart(estilo_ejecutivo(fig, "Composición de lotes por cantidad de anchos"), use_container_width=True)
+    with g4:
+        if len(reports["LNK_COMPLETITUD"]):
+            ds = reports["LNK_COMPLETITUD"]["ESTADO"].value_counts().rename_axis("ESTADO").reset_index(name="LNK")
+            fig = px.pie(ds, names="ESTADO", values="LNK", hole=.62,
+                         color="ESTADO", color_discrete_map={"COMPLETO":ELC_BLUE,"COMPLETO (SCRAP)":ELC_ORANGE,"INCOMPLETO":ELC_GRAY})
+            fig.update_traces(textposition="inside", textinfo="percent+label", hovertemplate="%{label}: %{value} LNK<br>%{percent}<extra></extra>")
+            fig.add_annotation(text=f"{ds['LNK'].sum():,.0f}<br><span style='font-size:12px'>LNK</span>", x=.5, y=.5, showarrow=False, font=dict(size=22,color=ELC_NAVY))
+            st.plotly_chart(estilo_ejecutivo(fig, "Completitud de LNK"), use_container_width=True)
 
-    if len(df_resumen) > 0:
-        fig3 = px.histogram(df_resumen, x="ANCHOS_UNICOS", title="Distribución de # de anchos por lote")
-        st.plotly_chart(fig3, use_container_width=True)
-
-    if len(reports["LNK_COMPLETITUD"]) > 0:
-        fig4 = px.pie(reports["LNK_COMPLETITUD"], names="ESTADO", title="Estado de completitud por LNK")
-        st.plotly_chart(fig4, use_container_width=True)
-
-    if len(df_resumen) > 0:
-        fig5 = px.bar(df_resumen["REGLA_DOMINANTE"].value_counts().reset_index(),
-                      x="REGLA_DOMINANTE", y="count", title="Top reglas aplicadas (conteo de lotes)")
-        st.plotly_chart(fig5, use_container_width=True)
-
-    if len(df_exced) > 0:
-        fig6 = px.bar(df_exced.groupby(["MIX"], as_index=False)["LBS_RESTANTES"].sum(),
-                      x="MIX", y="LBS_RESTANTES", title="Excedentes por MIX")
-        st.plotly_chart(fig6, use_container_width=True)
+    g5, g6 = st.columns(2)
+    with g5:
+        if len(df_resumen):
+            dr = df_resumen["REGLA_DOMINANTE"].fillna("SIN REGLA").value_counts().head(10).sort_values().rename_axis("REGLA").reset_index(name="LOTES")
+            fig = px.bar(dr, x="LOTES", y="REGLA", orientation="h", text="LOTES", color="LOTES",
+                         color_continuous_scale=[[0, ELC_SKY], [1, ELC_NAVY]])
+            fig.update_traces(textposition="outside", hovertemplate="%{y}: %{x} lotes<extra></extra>")
+            fig.update_layout(coloraxis_showscale=False)
+            st.plotly_chart(estilo_ejecutivo(fig, "Reglas dominantes", 450), use_container_width=True)
+    with g6:
+        if len(df_exced):
+            de = df_exced.groupby("MIX", as_index=False)["LBS_RESTANTES"].sum().sort_values("LBS_RESTANTES", ascending=False)
+            fig = px.bar(de, x="MIX", y="LBS_RESTANTES", text_auto=",.0f", color="MIX",
+                         color_discrete_sequence=[ELC_ORANGE, ELC_BLUE, ELC_SKY])
+            fig.update_traces(textposition="outside", hovertemplate="%{x}: %{y:,.0f} lb<extra></extra>")
+            st.plotly_chart(estilo_ejecutivo(fig, "Libras pendientes por proceso"), use_container_width=True)
 
     st.header("7. Descarga del Excel completo")
     if "excel_bytes" not in st.session_state:
